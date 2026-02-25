@@ -160,7 +160,7 @@ def create_security_hooks(
     Args:
         user_id: Current user ID for isolation validation
         sdk_cwd: SDK working directory for workspace-scoped tool validation
-        max_subtasks: Maximum Task (sub-agent) spawns allowed per session
+        max_subtasks: Maximum concurrent Task (sub-agent) spawns allowed per session
         on_stop: Callback ``(transcript_path, sdk_session_id)`` invoked when
             the SDK finishes processing — used to read the JSONL transcript
             before the CLI process exits.
@@ -172,8 +172,11 @@ def create_security_hooks(
         from claude_agent_sdk import HookMatcher
         from claude_agent_sdk.types import HookContext, HookInput, SyncHookJSONOutput
 
-        # Per-session counter for Task sub-agent spawns
+        # Per-session tracking for Task sub-agent concurrency.
+        # task_tool_use_ids records which tool_use_ids actually consumed a slot
+        # so post hooks only release slots for Tasks that were truly started.
         task_spawn_count = 0
+        task_tool_use_ids: set[str] = set()
 
         async def pre_tool_use_hook(
             input_data: HookInput,
@@ -207,11 +210,14 @@ def create_security_hooks(
                     return cast(
                         SyncHookJSONOutput,
                         _deny(
-                            f"Maximum {max_subtasks} sub-tasks per session. "
-                            "Please continue in the main conversation."
+                            f"Maximum {max_subtasks} concurrent sub-tasks. "
+                            "Wait for running sub-tasks to finish, "
+                            "or continue in the main conversation."
                         ),
                     )
                 task_spawn_count += 1
+                if tool_use_id:
+                    task_tool_use_ids.add(tool_use_id)
 
             # Strip MCP prefix for consistent validation
             is_copilot_tool = tool_name.startswith(MCP_TOOL_PREFIX)
@@ -244,8 +250,20 @@ def create_security_hooks(
             are executed by the CLI internally — this hook captures their
             output so the response adapter can forward it to the frontend.
             """
+            nonlocal task_spawn_count
             _ = context
             tool_name = cast(str, input_data.get("tool_name", ""))
+
+            # Release a subtask slot when a Task completes (concurrency limit)
+            if tool_name == "Task" and tool_use_id and tool_use_id in task_tool_use_ids:
+                task_tool_use_ids.discard(tool_use_id)
+                task_spawn_count -= 1
+                logger.info(
+                    "[SDK] Task completed, active=%d/%d, user=%s",
+                    task_spawn_count,
+                    max_subtasks,
+                    user_id,
+                )
             is_builtin = not tool_name.startswith(MCP_TOOL_PREFIX)
             logger.info(
                 "[SDK] PostToolUse: %s (builtin=%s, tool_use_id=%s)",
@@ -282,6 +300,7 @@ def create_security_hooks(
             context: HookContext,
         ) -> SyncHookJSONOutput:
             """Log failed tool executions for debugging."""
+            nonlocal task_spawn_count
             _ = context
             tool_name = cast(str, input_data.get("tool_name", ""))
             error = input_data.get("error", "Unknown error")
@@ -289,6 +308,17 @@ def create_security_hooks(
                 f"[SDK] Tool failed: {tool_name}, error={error}, "
                 f"user={user_id}, tool_use_id={tool_use_id}"
             )
+
+            if tool_name == "Task" and tool_use_id and tool_use_id in task_tool_use_ids:
+                task_tool_use_ids.discard(tool_use_id)
+                task_spawn_count -= 1
+                logger.info(
+                    "[SDK] Failed Task released slot, active=%d/%d, user=%s",
+                    task_spawn_count,
+                    max_subtasks,
+                    user_id,
+                )
+
             return cast(SyncHookJSONOutput, {})
 
         async def pre_compact_hook(
